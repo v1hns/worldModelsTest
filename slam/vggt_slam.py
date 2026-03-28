@@ -262,6 +262,8 @@ class VGGT_SLAM:
         H, W = tensors[0].shape[1], tensors[0].shape[2]
 
         if self._vggt_available:
+            from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # type: ignore
+
             batch = torch.stack(tensors).unsqueeze(0)
             autocast_context = (
                 torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -271,12 +273,15 @@ class VGGT_SLAM:
             with torch.no_grad(), autocast_context:
                 raw = self._vggt(batch)
 
-            extrinsics = raw.get("extrinsic", raw.get("extrinsics"))
-            intrinsics = raw.get("intrinsic", raw.get("intrinsics"))
+            pose_enc = raw.get("pose_enc")
             depth = raw.get("depth")
+            extrinsics, intrinsics = pose_encoding_to_extri_intri(pose_enc, image_size_hw=(H, W))
+            if depth is None or pose_enc is None:
+                raise RuntimeError("VGGT output is missing required pose/depth predictions")
+
             attn_feats = raw.get("attention_features")
             if attn_feats is None:
-                attn_feats = [depth[0, i].mean().reshape(1) for i in range(N)]
+                attn_feats = [pose_enc[0, i].flatten() for i in range(N)]
             elif isinstance(attn_feats, torch.Tensor):
                 attn_feats = [attn_feats[0, i].flatten() for i in range(attn_feats.shape[1])]
             else:
@@ -285,7 +290,7 @@ class VGGT_SLAM:
             return {
                 "extrinsics": extrinsics[0],
                 "intrinsics": intrinsics[0],
-                "depth": depth[0],
+                "depth": depth[0].squeeze(-1),
                 "attention_features": attn_feats,
             }
 

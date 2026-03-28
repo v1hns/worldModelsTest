@@ -57,8 +57,8 @@ def load_frames_from_dir(path: str):
     return frames
 
 
-def synthetic_frames(n: int, H: int = 240, W: int = 320):
-    """Generate n random RGB frames (simulates a camera moving through noise)."""
+def synthetic_frames(n: int, H: int = 252, W: int = 336):
+    """Generate n random RGB frames using VGGT-compatible dimensions."""
     frames = []
     for i in range(n):
         # Slowly shifting colour gradient to simulate motion
