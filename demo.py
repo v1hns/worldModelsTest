@@ -1,22 +1,24 @@
 """
-demo.py — Run VGGT-SLAM on a video file or a folder of images.
+demo.py — Run the SLAM pipeline on any supported model.
 
 Usage
 -----
-# From a video file:
-python demo.py --source path/to/video.mp4
-
-# From a folder of images (jpg/png, sorted by name):
-python demo.py --source path/to/frames/
-
-# Synthetic test (no real data needed):
+# Synthetic frames, default model (vggt):
 python demo.py --synthetic --num_frames 50
+
+# Choose a model explicitly:
+python demo.py --model vggt   --source path/to/video.mp4
+python demo.py --model dummy  --synthetic --num_frames 30
+
+# Save results:
+python demo.py --synthetic --output results.npz --visualize
 
 Options
 -------
+--model         Model to use: vggt | dummy  (default: vggt)
 --source        Path to a video file or image directory.
 --synthetic     Generate random frames instead of reading a file.
---num_frames    Number of synthetic frames to generate (default: 30).
+--num_frames    Number of synthetic frames (default: 30).
 --submap_size   Frames per submap (default: 10).
 --output        Save trajectory + point-cloud to this .npz file.
 --visualize     Show a live matplotlib trajectory plot.
@@ -90,7 +92,7 @@ def visualize_trajectory(trajectory: np.ndarray):
         ax.set_xlabel("X (m)")
         ax.set_ylabel("Y (m)")
         ax.set_zlabel("Z (m)")
-        ax.set_title("VGGT-SLAM 2.0 — Estimated Trajectory")
+        ax.set_title("SLAM Pipeline — Estimated Trajectory")
         ax.legend()
         plt.tight_layout()
 
@@ -102,8 +104,16 @@ def visualize_trajectory(trajectory: np.ndarray):
         print(f"[demo] Visualisation skipped: {e}")
 
 
+MODELS = {
+    "vggt":  lambda: __import__("slam.models", fromlist=["VGGTModel"]).VGGTModel(),
+    "dummy": lambda: __import__("slam.models", fromlist=["DummyModel"]).DummyModel(),
+}
+
+
 def main():
-    parser = argparse.ArgumentParser(description="VGGT-SLAM 2.0 demo")
+    parser = argparse.ArgumentParser(description="SLAM pipeline demo")
+    parser.add_argument("--model", default="vggt", choices=list(MODELS),
+                        help="Model backend to use (default: vggt)")
     parser.add_argument("--source", default=None,
                         help="Path to video file or image directory")
     parser.add_argument("--synthetic", action="store_true",
