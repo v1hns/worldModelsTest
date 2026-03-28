@@ -1,37 +1,46 @@
 """
-Attention-based image retrieval for loop-closure detection.
-
-From the paper (Section IV):
-  "We leverage attention layers from VGGT for image retrieval verification
-   without requiring additional training, enabling false-match rejection."
-
-VGGT's transformer produces per-image attention feature vectors. We index
-these with a simple cosine-similarity search. In the full system this would
-use approximate nearest-neighbour (e.g. FAISS) for real-time performance.
+Attention-based image retrieval with optional FAISS acceleration.
 """
 
-import torch
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 import numpy as np
-from typing import List, Tuple, Optional
+import torch
+
+
+@dataclass
+class RetrievalCandidate:
+    frame_id: int
+    score: float
 
 
 class AttentionRetrieval:
     """
-    Stores per-frame attention feature vectors and provides top-k
-    cosine-similarity search, used to propose loop-closure candidates.
+    Stores per-frame attention feature vectors and provides top-k similarity
+    search. Uses FAISS when requested and available, otherwise falls back to a
+    brute-force cosine search over normalized descriptors.
     """
 
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu", backend: str = "faiss"):
         self.device = device
+        self.backend = backend
         self._frame_ids: List[int] = []
-        self._features: Optional[torch.Tensor] = None   # (N, D)
+        self._features: Optional[torch.Tensor] = None
+        self._faiss_index = None
+        self._faiss_available = False
+        if backend == "faiss":
+            try:
+                import faiss  # type: ignore
+
+                self._faiss_available = True
+                self._faiss = faiss
+            except ImportError:
+                self._faiss_available = False
 
     def add(self, frame_id: int, feature: torch.Tensor):
-        """
-        Register a new frame's attention feature.
-
-        feature: 1-D tensor of arbitrary length (will be L2-normalised).
-        """
         feat = feature.to(self.device).float().flatten()
         feat = feat / (feat.norm() + 1e-8)
 
@@ -41,22 +50,27 @@ class AttentionRetrieval:
         else:
             self._features = torch.cat([self._features, feat.unsqueeze(0)], dim=0)
 
+        if self.backend == "faiss" and self._faiss_available:
+            self._rebuild_faiss_index()
+
+    def _rebuild_faiss_index(self):
+        if self._features is None:
+            self._faiss_index = None
+            return
+        feats = self._features.detach().cpu().numpy().astype("float32")
+        index = self._faiss.IndexFlatIP(feats.shape[1])
+        index.add(feats)
+        self._faiss_index = index
+
     def query(
         self,
         query_idx: int,
         k: int = 5,
         min_distance: int = 10,
     ) -> List[Tuple[int, float]]:
-        """
-        Return the top-k most similar past frames (by cosine similarity)
-        that are at least `min_distance` frames before `query_idx`.
-
-        Returns list of (frame_id, similarity_score).
-        """
         if self._features is None or len(self._frame_ids) < 2:
             return []
 
-        # Find position of query_idx
         try:
             q_pos = self._frame_ids.index(query_idx)
         except ValueError:
@@ -65,36 +79,40 @@ class AttentionRetrieval:
         if q_pos == 0:
             return []
 
-        q_feat = self._features[q_pos]  # (D,)
-
-        # Only consider frames far enough in the past
-        candidates = [
-            (i, fid)
-            for i, fid in enumerate(self._frame_ids[:q_pos])
-            if (query_idx - fid) >= min_distance
+        valid_positions = [
+            pos for pos, fid in enumerate(self._frame_ids[:q_pos]) if (query_idx - fid) >= min_distance
         ]
-        if not candidates:
+        if not valid_positions:
             return []
 
-        idxs = [c[0] for c in candidates]
-        cand_feats = self._features[idxs]  # (M, D)
+        if self.backend == "faiss" and self._faiss_available and self._faiss_index is not None:
+            q_feat = self._features[q_pos : q_pos + 1].detach().cpu().numpy().astype("float32")
+            scores, idxs = self._faiss_index.search(q_feat, min(len(self._frame_ids), max(k * 4, k)))
+            results = []
+            valid_set = set(valid_positions)
+            for pos, score in zip(idxs[0], scores[0]):
+                if pos < 0 or pos not in valid_set:
+                    continue
+                results.append((self._frame_ids[pos], float(score)))
+                if len(results) >= k:
+                    break
+            return results
 
-        scores = torch.mv(cand_feats, q_feat)  # (M,) cosine sims (already normalised)
-        scores_np = scores.cpu().numpy()
-
-        top_k_local = np.argsort(scores_np)[::-1][:k]
-        results = []
-        for local_i in top_k_local:
-            orig_frame_id = candidates[local_i][1]
-            sim = float(scores_np[local_i])
-            results.append((orig_frame_id, sim))
-
-        return results
+        q_feat = self._features[q_pos]
+        cand_feats = self._features[valid_positions]
+        scores = torch.mv(cand_feats, q_feat).cpu().numpy()
+        top_local = np.argsort(scores)[::-1][:k]
+        return [(self._frame_ids[valid_positions[i]], float(scores[i])) for i in top_local]
 
     def reset(self):
         self._frame_ids.clear()
         self._features = None
+        self._faiss_index = None
 
     @property
     def size(self) -> int:
         return len(self._frame_ids)
+
+    @property
+    def using_faiss(self) -> bool:
+        return self.backend == "faiss" and self._faiss_available
