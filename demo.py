@@ -20,6 +20,8 @@ Options
 --submap_size   Frames per submap (default: 10).
 --output        Save trajectory + point-cloud to this .npz file.
 --visualize     Show a live matplotlib trajectory plot.
+--export_colmap Export poses/intrinsics in COLMAP text format.
+--benchmark_gt  Path to a TUM-style ground-truth file for ATE evaluation.
 """
 
 import argparse
@@ -113,6 +115,16 @@ def main():
                         help="Save results to .npz file")
     parser.add_argument("--visualize", action="store_true",
                         help="Save trajectory plot as trajectory.png")
+    parser.add_argument("--export_colmap", default=None,
+                        help="Export COLMAP text files into this directory")
+    parser.add_argument("--benchmark_gt", default=None,
+                        help="Path to TUM-format ground-truth trajectory")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Enable fp16 inference when running on CUDA")
+    parser.add_argument("--async_inference", action="store_true",
+                        help="Run inference through the async worker")
+    parser.add_argument("--enable_detection", action="store_true",
+                        help="Enable Grounding DINO object detection if installed")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -138,8 +150,15 @@ def main():
     # Run SLAM
     # ------------------------------------------------------------------
     from slam.vggt_slam import VGGT_SLAM, SLAMConfig
+    from slam.benchmark import load_tum_ground_truth, run_tum_evaluation
 
-    cfg = SLAMConfig(submap_size=args.submap_size, verbose=True)
+    cfg = SLAMConfig(
+        submap_size=args.submap_size,
+        verbose=True,
+        fp16=args.fp16,
+        async_inference=args.async_inference,
+        enable_object_detection=args.enable_detection,
+    )
     slam = VGGT_SLAM(config=cfg)
 
     from tqdm import tqdm
@@ -167,8 +186,17 @@ def main():
         )
         print(f"[demo] Results saved to {args.output}")
 
+    if args.export_colmap:
+        slam.export_colmap(args.export_colmap)
+        print(f"[demo] COLMAP export written to {args.export_colmap}")
+
     if args.visualize:
         visualize_trajectory(trajectory)
+
+    if args.benchmark_gt:
+        gt = load_tum_ground_truth(args.benchmark_gt)
+        report = run_tum_evaluation(trajectory, gt, "tum_eval_report.json")
+        print(f"[demo] TUM evaluation report saved to tum_eval_report.json: {report}")
 
 
 if __name__ == "__main__":

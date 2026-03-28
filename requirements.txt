@@ -10,3 +10,10 @@ tqdm>=4.65.0
 
 # VGGT (install from source)
 # git clone https://github.com/facebookresearch/vggt && pip install -e ./vggt
+
+# Optional integrations
+# faiss-cpu           # retrieval acceleration
+# gtsam               # nonlinear pose graph optimization
+# open3d              # real-time 3D visualization
+# GroundingDINO       # open-set object detection (install from source)
+# rclpy               # ROS2 integration (installed via ROS2 distribution)

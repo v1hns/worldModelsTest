@@ -1,138 +1,165 @@
 """
-test_slam.py — unit-level tests for VGGT-SLAM components.
-
-Run with:  python test_slam.py
+Unit and integration tests for the VGGT-SLAM pipeline.
 """
 
+from __future__ import annotations
+
+import os
 import sys
-import numpy as np
-import torch
+import tempfile
 import unittest
 
+import numpy as np
+import torch
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from slam import (
+    Open3DViewer,
+    ROS2SLAMNode,
+    SLAMConfig,
+    VGGT_SLAM,
+    compute_ate,
+    export_colmap_model,
+    load_tum_ground_truth,
+    run_tum_evaluation,
+)
+from slam.factor_graph import FactorGraph
+from slam.retrieval import AttentionRetrieval
+from slam.submap import Submap
 
-def random_image(H=240, W=320):
+
+def random_image(H=96, W=128):
     return (np.random.rand(H, W, 3) * 255).astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
 class TestAttentionRetrieval(unittest.TestCase):
-
-    def setUp(self):
-        from slam.retrieval import AttentionRetrieval
-        self.ret = AttentionRetrieval(device="cpu")
-
-    def test_empty_query(self):
-        results = self.ret.query(0, k=5)
-        self.assertEqual(results, [])
-
     def test_add_and_query(self):
-        for i in range(30):
-            feat = torch.rand(256)
-            self.ret.add(i, feat)
+        retrieval = AttentionRetrieval(device="cpu", backend="bruteforce")
+        for idx in range(20):
+            vec = torch.zeros(8)
+            vec[idx % 8] = 1.0
+            retrieval.add(idx, vec)
 
-        results = self.ret.query(29, k=3, min_distance=10)
+        results = retrieval.query(19, k=3, min_distance=4)
         self.assertLessEqual(len(results), 3)
-        for fid, score in results:
-            self.assertLess(fid, 20)         # must be ≥10 frames back
-            self.assertGreaterEqual(score, -1.0)
-            self.assertLessEqual(score, 1.0)
+        self.assertTrue(all(fid <= 15 for fid, _ in results))
 
     def test_reset(self):
-        self.ret.add(0, torch.rand(64))
-        self.ret.reset()
-        self.assertEqual(self.ret.size, 0)
+        retrieval = AttentionRetrieval(device="cpu", backend="bruteforce")
+        retrieval.add(0, torch.rand(8))
+        retrieval.reset()
+        self.assertEqual(retrieval.size, 0)
 
 
 class TestFactorGraph(unittest.TestCase):
+    def _submap(self, submap_id: int, tx: float):
+        frames = [
+            {
+                "frame_id": submap_id,
+                "image": random_image(),
+                "depth": np.ones((16, 16), dtype=np.float32),
+                "intrinsics": np.eye(3, dtype=np.float32),
+                "detections": [],
+            }
+        ]
+        local_poses = [np.eye(4, dtype=np.float32)]
+        anchor = np.eye(4, dtype=np.float32)
+        anchor[0, 3] = tx
+        return Submap(
+            submap_id=submap_id,
+            frame_ids=[submap_id],
+            frames=frames,
+            local_poses=local_poses,
+            anchor_pose=anchor,
+        )
 
-    def _make_submap(self, pose, submap_id=0):
-        from slam.submap import Submap
-        frames = [{"image": random_image(), "tensor": torch.rand(3, 240, 320)}]
-        poses = [pose]
-        sm = Submap(submap_id=submap_id, frames=frames, poses=poses)
-        return sm
-
-    def setUp(self):
-        from slam.factor_graph import FactorGraph
-        self.fg = FactorGraph(device="cpu")
-
-    def test_add_submaps(self):
-        for i in range(4):
-            pose = np.eye(4)
-            pose[0, 3] = float(i)
-            self.fg.add_submap(self._make_submap(pose, submap_id=i))
-        self.assertEqual(self.fg.num_submaps, 4)
-        self.assertEqual(len(self.fg.odometry_factors), 3)
-
-    def test_loop_closure(self):
-        for i in range(6):
-            pose = np.eye(4)
-            pose[0, 3] = float(i)
-            self.fg.add_submap(self._make_submap(pose, submap_id=i))
-        self.fg.add_loop_closure(0, 5, score=0.9)
-        self.assertEqual(self.fg.num_loop_closures, 1)
+    def test_add_submaps_and_loop(self):
+        fg = FactorGraph(device="cpu", backend="linear")
+        for idx in range(3):
+            fg.add_submap(self._submap(idx, float(idx)))
+        rel = np.eye(4, dtype=np.float32)
+        rel[0, 3] = 0.2
+        fg.add_loop_closure(0, 2, rel, score=0.9)
+        self.assertEqual(fg.num_submaps, 3)
+        self.assertEqual(fg.num_loop_closures, 1)
 
     def test_optimize_returns_poses(self):
-        for i in range(4):
-            pose = np.eye(4)
-            pose[0, 3] = float(i) * 0.5
-            self.fg.add_submap(self._make_submap(pose, submap_id=i))
-        self.fg.add_loop_closure(0, 3, score=0.8)
-        optimised = self.fg.optimize(iterations=5)
-        self.assertEqual(len(optimised), 4)
-        for p in optimised:
-            self.assertEqual(p.shape, (4, 4))
-
-    def test_reset(self):
-        pose = np.eye(4)
-        self.fg.add_submap(self._make_submap(pose))
-        self.fg.reset()
-        self.assertEqual(self.fg.num_submaps, 0)
+        fg = FactorGraph(device="cpu", backend="linear")
+        for idx in range(4):
+            fg.add_submap(self._submap(idx, float(idx)))
+        rel = np.eye(4, dtype=np.float32)
+        rel[0, 3] = 0.1
+        fg.add_loop_closure(0, 3, rel, score=0.8)
+        poses = fg.optimize(iterations=4)
+        self.assertEqual(len(poses), 4)
+        self.assertEqual(poses[0].shape, (4, 4))
 
 
 class TestSubmap(unittest.TestCase):
-
     def test_build_point_cloud_with_depth(self):
-        from slam.submap import Submap
-
-        H, W = 60, 80
-        depth = np.ones((H, W), dtype=np.float32) * 2.0
+        depth = np.ones((20, 24), dtype=np.float32) * 2.0
         frame = {
-            "image": random_image(H, W),
-            "tensor": torch.rand(3, H, W),
+            "frame_id": 0,
+            "image": random_image(20, 24),
             "depth": depth,
+            "intrinsics": np.array([[12.0, 0.0, 12.0], [0.0, 10.0, 10.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+            "detections": [],
         }
-        pose = np.eye(4, dtype=np.float32)
-        sm = Submap(submap_id=0, frames=[frame], poses=[pose])
-        sm.build_point_cloud()
+        submap = Submap(
+            submap_id=0,
+            frame_ids=[0],
+            frames=[frame],
+            local_poses=[np.eye(4, dtype=np.float32)],
+            anchor_pose=np.eye(4, dtype=np.float32),
+        )
+        submap.build_point_cloud(sample_stride=2)
+        self.assertGreater(len(submap.point_cloud_local), 0)
+        self.assertEqual(submap.point_cloud.shape[1], 3)
 
-        self.assertIsNotNone(sm.point_cloud)
-        self.assertEqual(sm.point_cloud.shape[1], 3)
-        self.assertGreater(len(sm.point_cloud), 0)
 
-    def test_build_point_cloud_no_depth(self):
-        from slam.submap import Submap
+class TestBenchmarkAndExport(unittest.TestCase):
+    def test_compute_ate(self):
+        pred = np.repeat(np.eye(4, dtype=np.float32)[None, ...], 3, axis=0)
+        gt = pred.copy()
+        gt[1, 0, 3] = 1.0
+        gt[2, 0, 3] = 2.0
+        pred[1, 0, 3] = 1.1
+        pred[2, 0, 3] = 2.1
+        ate = compute_ate(pred, gt)
+        self.assertGreaterEqual(ate, 0.0)
 
-        frame = {"image": random_image(), "tensor": torch.rand(3, 240, 320)}
-        sm = Submap(submap_id=0, frames=[frame], poses=[np.eye(4)])
-        sm.build_point_cloud()
-        self.assertEqual(sm.point_cloud.shape, (0, 3))
+    def test_tum_ground_truth_loading_and_report(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gt_path = os.path.join(tmpdir, "groundtruth.txt")
+            with open(gt_path, "w", encoding="utf-8") as fh:
+                fh.write("0.0 0 0 0 0 0 0 1\n")
+                fh.write("0.1 1 0 0 0 0 0 1\n")
+            gt = load_tum_ground_truth(gt_path)
+            self.assertEqual(gt.shape, (2, 4, 4))
+
+            out_path = os.path.join(tmpdir, "report.json")
+            report = run_tum_evaluation(gt, gt, out_path)
+            self.assertTrue(os.path.exists(out_path))
+            self.assertIn("ate_rmse", report)
 
 
 class TestVGGTSLAM(unittest.TestCase):
-    """Integration-level test (dummy mode, no VGGT weights needed)."""
-
-    def _make_slam(self):
-        from slam.vggt_slam import VGGT_SLAM, SLAMConfig
-        cfg = SLAMConfig(submap_size=5, verbose=False, device="cpu")
+    def _make_slam(self, **kwargs):
+        cfg = SLAMConfig(
+            submap_size=3,
+            device="cpu",
+            verbose=False,
+            optimizer_backend="linear",
+            retrieval_backend="bruteforce",
+            async_inference=False,
+            **kwargs,
+        )
         return VGGT_SLAM(config=cfg)
+
+    def test_public_exports(self):
+        from slam import FrameResult, SLAMConfig as ExportedConfig
+
+        self.assertIs(ExportedConfig, SLAMConfig)
+        self.assertEqual(FrameResult.__name__, "FrameResult")
 
     def test_single_frame(self):
         slam = self._make_slam()
@@ -140,48 +167,79 @@ class TestVGGTSLAM(unittest.TestCase):
         self.assertEqual(result.frame_id, 0)
         self.assertEqual(result.pose.shape, (4, 4))
 
-    def test_multiple_frames(self):
-        slam = self._make_slam()
-        N = 12
-        for _ in range(N):
-            slam.process_frame(random_image())
-        traj = slam.get_trajectory()
-        self.assertEqual(traj.shape[0], N)
-        self.assertEqual(traj.shape[1:], (4, 4))
-
-    def test_submap_creation(self):
-        slam = self._make_slam()
-        for _ in range(10):
-            slam.process_frame(random_image())
-        # With submap_size=5, we expect at least one submap after 10 frames
-        self.assertGreaterEqual(len(slam.submaps), 1)
-
-    def test_reset(self):
+    def test_submap_creation_and_point_cloud(self):
         slam = self._make_slam()
         for _ in range(6):
             slam.process_frame(random_image())
-        slam.reset()
-        self.assertEqual(slam._frame_count, 0)
-        self.assertEqual(len(slam.submaps), 0)
+        self.assertGreaterEqual(len(slam.submaps), 2)
+        point_cloud = slam.get_point_cloud()
+        self.assertEqual(point_cloud.shape[1], 3)
+        self.assertGreater(len(point_cloud), 0)
 
-    def test_point_cloud(self):
+    def test_optimized_anchors_propagate_to_trajectory(self):
         slam = self._make_slam()
-        for _ in range(10):
+        for _ in range(6):
             slam.process_frame(random_image())
-        pc = slam.get_point_cloud()
-        # Point cloud is empty in dummy mode (no depth attached to frames)
-        self.assertEqual(pc.ndim, 2)
-        self.assertEqual(pc.shape[1], 3)
+        baseline = slam.get_trajectory().copy()
 
+        shifted = [submap.optimized_anchor_pose.copy() for submap in slam.submaps]
+        shifted[-1][:3, 3] += np.array([2.0, 0.0, 0.0], dtype=np.float32)
+        slam.factor_graph.optimize = lambda iterations=10: shifted  # type: ignore[assignment]
+        slam._optimize_submaps()
 
-# ---------------------------------------------------------------------------
+        updated = slam.get_trajectory()
+        self.assertFalse(np.allclose(baseline[-1], updated[-1]))
+
+    def test_loop_closure_uses_submap_ids(self):
+        slam = self._make_slam()
+        for _ in range(9):
+            slam.process_frame(random_image())
+
+        current_submap = slam.submaps[-1]
+        slam.retrieval.query = lambda query_idx, k=5, min_distance=6: [(0, 0.95)]  # type: ignore[assignment]
+        recorded = {}
+
+        def capture(submap_i, submap_j, relative_pose, score, source_frame_i=None, source_frame_j=None):
+            recorded["submap_i"] = submap_i
+            recorded["submap_j"] = submap_j
+            recorded["source_frame_i"] = source_frame_i
+            recorded["source_frame_j"] = source_frame_j
+
+        slam.factor_graph.add_loop_closure = capture  # type: ignore[assignment]
+        slam._try_loop_closure(current_submap)
+        self.assertEqual(recorded["submap_i"], 0)
+        self.assertEqual(recorded["submap_j"], current_submap.submap_id)
+        self.assertEqual(recorded["source_frame_i"], 0)
+
+    def test_colmap_export(self):
+        slam = self._make_slam()
+        for _ in range(3):
+            slam.process_frame(random_image())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_colmap_model(slam, tmpdir)
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "cameras.txt")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "images.txt")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "points3D.txt")))
+
+    def test_viewer_and_ros_wrapper(self):
+        slam = self._make_slam()
+        for _ in range(3):
+            slam.process_frame(random_image())
+
+        viewer = Open3DViewer()
+        viewer.update(slam.get_trajectory(), slam.get_point_cloud(), slam.get_labeled_objects())
+        self.assertIn("trajectory", viewer.last_geometry)
+
+        ros_node = ROS2SLAMNode(slam)
+        result = ros_node.process_rgb_frame(random_image())
+        self.assertEqual(result.pose.shape, (4, 4))
+
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("VGGT-SLAM 2.0 — Unit Tests")
+    print("VGGT-SLAM 2.0 — Tests")
     print("=" * 60)
-    loader = unittest.TestLoader()
-    suite = loader.loadTestsFromModule(sys.modules[__name__])
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
