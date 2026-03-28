@@ -1,0 +1,12 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+Pillow>=10.0.0
+huggingface_hub>=0.20.0
+opencv-python>=4.8.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+tqdm>=4.65.0
+
+# VGGT (install from source)
+# git clone https://github.com/facebookresearch/vggt && pip install -e ./vggt
