@@ -21,6 +21,7 @@ from .base_model import BaseReconstructionModel
 from .submap import Submap
 from .factor_graph import FactorGraph
 from .retrieval import AttentionRetrieval
+from .utils import ensure_homogeneous, relative_pose
 
 
 @dataclass
@@ -143,16 +144,25 @@ class SLAMPipeline:
     def _flush_submap(self):
         frames = self._frame_buffer[:]
         start_idx = self._frame_count - len(frames)
-        poses = self._global_poses[start_idx:]
+        world_poses = self._global_poses[start_idx:]
 
-        sm = Submap(submap_id=len(self.submaps), frames=frames, poses=poses)
+        anchor_pose = world_poses[0].astype(np.float32)
+        local_poses = [relative_pose(anchor_pose, p) for p in world_poses]
+
+        sm = Submap(
+            submap_id=len(self.submaps),
+            frame_ids=[start_idx + i for i in range(len(frames))],
+            frames=frames,
+            local_poses=local_poses,
+            anchor_pose=anchor_pose,
+        )
         sm.build_point_cloud()
         self.factor_graph.add_submap(sm)
         self.submaps.append(sm)
         self._frame_buffer.clear()
 
         if self.cfg.verbose:
-            n_pts = len(sm.point_cloud) if sm.point_cloud is not None else 0
+            n_pts = len(sm.point_cloud_local)
             print(f"[SLAMPipeline] Submap {sm.submap_id} | "
                   f"{len(frames)} frames | {n_pts} pts")
 
@@ -164,12 +174,17 @@ class SLAMPipeline:
         )
         for cand_idx, score in candidates:
             if score >= self.cfg.loop_closure_thresh:
+                # Map frame ids to submap ids
+                cand_submap = cand_idx // self.cfg.submap_size
+                cur_submap = (self._frame_count - 1) // self.cfg.submap_size
+                rel = np.eye(4, dtype=np.float32)  # identity as placeholder
                 self.factor_graph.add_loop_closure(
-                    frame_i=cand_idx,
-                    frame_j=self._frame_count - 1,
+                    submap_i=cand_submap,
+                    submap_j=cur_submap,
+                    relative_pose=rel,
                     score=float(score),
                 )
                 if self.cfg.verbose:
                     print(f"[SLAMPipeline] Loop closure: "
-                          f"{cand_idx} ↔ {self._frame_count - 1} "
+                          f"frame {cand_idx} ↔ frame {self._frame_count - 1} "
                           f"(score={score:.3f})")

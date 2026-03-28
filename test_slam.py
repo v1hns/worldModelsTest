@@ -162,7 +162,7 @@ class TestVGGTSLAM(unittest.TestCase):
         self.assertEqual(FrameResult.__name__, "FrameResult")
 
     def test_single_frame(self):
-        p = self._make_pipeline()
+        p = self._make_slam()
         r = p.process_frame(random_image())
         self.assertEqual(r.frame_id, 0)
         self.assertEqual(r.pose.shape, (4, 4))
@@ -234,6 +234,158 @@ class TestVGGTSLAM(unittest.TestCase):
         ros_node = ROS2SLAMNode(slam)
         result = ros_node.process_rgb_frame(random_image())
         self.assertEqual(result.pose.shape, (4, 4))
+
+
+# ============================================================
+# Model-agnostic contract tests
+# ============================================================
+
+class _ModelContractMixin:
+    """
+    Inherit from this + unittest.TestCase and set self.model in setUp()
+    to run the full interface contract against any BaseReconstructionModel.
+    """
+
+    model = None
+
+    def test_name_is_nonempty_string(self):
+        self.assertIsInstance(self.model.name, str)
+        self.assertGreater(len(self.model.name), 0)
+
+    def test_load_does_not_raise(self):
+        self.model.load("cpu")
+
+    def test_preprocess_shape_and_dtype(self):
+        t = self.model.preprocess(random_image(60, 80))
+        self.assertIsInstance(t, torch.Tensor)
+        self.assertEqual(t.shape, (3, 60, 80))
+
+    def test_preprocess_value_range(self):
+        img = (np.ones((60, 80, 3)) * 200).astype(np.uint8)
+        t = self.model.preprocess(img)
+        self.assertLessEqual(float(t.max()), 1.0 + 1e-5)
+        self.assertGreaterEqual(float(t.min()), 0.0)
+
+    def test_predict_single_frame_shapes(self):
+        t = self.model.preprocess(random_image(60, 80))
+        pred = self.model.predict([t])
+        self.assertEqual(pred.extrinsics.shape, (1, 3, 4))
+        self.assertEqual(pred.intrinsics.shape, (1, 3, 3))
+        self.assertEqual(pred.depth.shape[0], 1)
+        self.assertEqual(len(pred.retrieval_features), 1)
+
+    def test_predict_multi_frame_shapes(self):
+        tensors = [self.model.preprocess(random_image(60, 80)) for _ in range(4)]
+        pred = self.model.predict(tensors)
+        self.assertEqual(pred.extrinsics.shape, (4, 3, 4))
+        self.assertEqual(pred.depth.shape[0], 4)
+        self.assertEqual(len(pred.retrieval_features), 4)
+
+    def test_retrieval_features_are_1d_tensors(self):
+        t = self.model.preprocess(random_image(60, 80))
+        pred = self.model.predict([t])
+        for feat in pred.retrieval_features:
+            self.assertIsInstance(feat, torch.Tensor)
+            self.assertEqual(feat.ndim, 1)
+
+
+class TestDummyModelContract(_ModelContractMixin, unittest.TestCase):
+    def setUp(self):
+        from slam.models import DummyModel
+        self.model = DummyModel(feat_dim=64, seed=0)
+        self.model.load("cpu")
+
+    def test_determinism(self):
+        from slam.models import DummyModel
+        m1 = DummyModel(seed=7)
+        m2 = DummyModel(seed=7)
+        m1.load("cpu")
+        m2.load("cpu")
+        t = m1.preprocess(random_image(30, 40))
+        self.assertTrue(torch.allclose(m1.predict([t]).extrinsics, m2.predict([t]).extrinsics))
+
+    def test_different_seeds_differ(self):
+        from slam.models import DummyModel
+        m1 = DummyModel(seed=1)
+        m2 = DummyModel(seed=2)
+        m1.load("cpu")
+        m2.load("cpu")
+        t = m1.preprocess(random_image(30, 40))
+        self.assertFalse(torch.allclose(m1.predict([t]).extrinsics, m2.predict([t]).extrinsics))
+
+
+class TestVGGTModelContract(_ModelContractMixin, unittest.TestCase):
+    """Contract tests against VGGTModel in dummy-fallback mode (no weights needed)."""
+
+    def setUp(self):
+        from slam.models import VGGTModel
+        self.model = VGGTModel()
+        self.model.load("cpu")
+
+
+class TestSLAMPipeline(unittest.TestCase):
+    """Integration tests for the model-agnostic SLAMPipeline."""
+
+    def _make_pipeline(self, **kwargs):
+        from slam import SLAMPipeline, SLAMConfig
+        from slam.models import DummyModel
+        cfg = SLAMConfig(
+            submap_size=5, verbose=False, device="cpu",
+            optimizer_backend="linear", retrieval_backend="bruteforce",
+            async_inference=False, **kwargs,
+        )
+        return SLAMPipeline(model=DummyModel(), config=cfg)
+
+    def test_single_frame(self):
+        p = self._make_pipeline()
+        r = p.process_frame(random_image())
+        self.assertEqual(r.frame_id, 0)
+        self.assertEqual(r.pose.shape, (4, 4))
+
+    def test_trajectory_length(self):
+        p = self._make_pipeline()
+        N = 12
+        for _ in range(N):
+            p.process_frame(random_image())
+        self.assertEqual(p.get_trajectory().shape, (N, 4, 4))
+
+    def test_submap_creation(self):
+        p = self._make_pipeline()
+        for _ in range(10):
+            p.process_frame(random_image())
+        self.assertGreaterEqual(len(p.submaps), 1)
+
+    def test_point_cloud_shape(self):
+        p = self._make_pipeline()
+        for _ in range(10):
+            p.process_frame(random_image())
+        pc = p.get_point_cloud()
+        self.assertEqual(pc.ndim, 2)
+        self.assertEqual(pc.shape[1], 3)
+
+    def test_reset(self):
+        p = self._make_pipeline()
+        for _ in range(6):
+            p.process_frame(random_image())
+        p.reset()
+        self.assertEqual(p._frame_count, 0)
+        self.assertEqual(len(p.submaps), 0)
+
+    def test_swap_model_gives_different_trajectories(self):
+        from slam import SLAMPipeline, SLAMConfig
+        from slam.models import DummyModel
+        cfg = SLAMConfig(
+            submap_size=5, verbose=False, device="cpu",
+            optimizer_backend="linear", retrieval_backend="bruteforce",
+            async_inference=False,
+        )
+        p1 = SLAMPipeline(model=DummyModel(seed=1), config=cfg)
+        p2 = SLAMPipeline(model=DummyModel(seed=99), config=cfg)
+        for _ in range(3):
+            p1.process_frame(random_image())
+            p2.process_frame(random_image())
+        self.assertEqual(p1.get_trajectory().shape, p2.get_trajectory().shape)
+        self.assertFalse(np.allclose(p1.get_trajectory(), p2.get_trajectory()))
 
 
 if __name__ == "__main__":
